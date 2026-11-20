@@ -289,8 +289,9 @@ with right:
 
     engines = engine_status(ss["mode_label"])
     if ss["mode_label"] == MODE_ONLINE and not engines["vision_model"]:
-        st.info("Online mode: no cloud vision model could be found, so EasyOCR is used. "
-                "Handwriting accuracy is limited - please correct the extracted text before grading.")
+        st.info("Online mode: no cloud vision model could be used, so EasyOCR is used. "
+                + (f"Reason: {ocr.VISION_PROBLEM} " if ocr.VISION_PROBLEM else "")
+                + "Handwriting accuracy is limited - please correct the extracted text before grading.")
     elif not ollama_status()[0] and not engines["vision_model"]:
         st.warning("Ollama is not running, so the vision model cannot be used. Start Ollama first "
                    "(see the red message in the sidebar). EasyOCR can still be used meanwhile.")
