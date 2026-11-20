@@ -2,7 +2,8 @@
 AI Grading Dashboard - teacher-facing app for rubric-based grading of handwritten answers.
 
 Run:   streamlit run app.py
-Needs: Ollama running with  deepseek-r1:8b  installed  (ollama pull deepseek-r1:8b)
+Local mode : Ollama running with  deepseek-r1:8b  installed  (ollama pull deepseek-r1:8b)
+Online mode: OLLAMA_API_KEY in Streamlit Secrets (Ollama Cloud)
 """
 import difflib
 import hashlib
@@ -31,6 +32,8 @@ FALLBACK_SUBJECTS = [
     "Software Engineering", "Cybersecurity", "Cloud Computing",
 ]
 OWN_QUESTION = "- write my own question -"
+MODE_LOCAL = "Local (DeepSeek-R1:8B)"
+MODE_ONLINE = "Online (Ollama Cloud)"
 
 st.set_page_config(page_title="AI Grading Dashboard", page_icon="📝", layout="wide")
 
@@ -210,8 +213,16 @@ if ALLOWED_SUBJECTS:
 # ------------------------------------------------------------------ sidebar
 with st.sidebar:
     st.header("📝 AI Grading Dashboard")
-    ok, msg = ollama_status()
-    (st.success if ok else st.error)(msg)
+    if "mode_label" not in ss:      # first load: Local if Ollama is reachable on this machine, else Online
+        ss["mode_label"] = MODE_LOCAL if ollama_status()[0] else MODE_ONLINE
+    st.radio("Grading mode", [MODE_LOCAL, MODE_ONLINE], key="mode_label")
+    grader.set_mode("local" if ss["mode_label"] == MODE_LOCAL else "online")   # BEFORE any grading call
+    if ss["mode_label"] == MODE_LOCAL:
+        ok, msg = ollama_status()
+        (st.success if ok else st.error)(msg)
+    else:
+        ok, msg = grader.check_cloud()
+        (st.success if ok else st.error)(msg)
     st.markdown(
         "**How it works**\n"
         "1. Enter the question, marks and rubric\n"
@@ -219,7 +230,8 @@ with st.sidebar:
         "3. Extract the text and **correct any mistakes**\n"
         "4. Grade, then download the PDF report"
     )
-    st.caption("Marks and feedback come from an AI model (DeepSeek-R1:8B). "
+    st.caption("Marks and feedback come from an AI model "
+               f"({'DeepSeek-R1:8B, local' if ss['mode_label'] == MODE_LOCAL else 'Ollama Cloud'}). "
                "They support the teacher and do not replace a human evaluator.")
     st.button("Start a new answer", on_click=reset_all)
     with st.expander("Class answer log (copy check)"):
@@ -267,7 +279,7 @@ with left:
             except grader.GradingError as e:
                 st.error(str(e))
             except Exception as e:
-                st.error(f"Ollama error: {e}")
+                st.error(f"Model error: {e}")
 
 with right:
     st.subheader("2. Handwritten answer")
@@ -276,7 +288,10 @@ with right:
     image_bytes = uploaded.getvalue() if uploaded else None
 
     engines = engine_status()
-    if not ollama_status()[0] and not engines["vision_model"]:
+    if ss["mode_label"] == MODE_ONLINE and not engines["vision_model"]:
+        st.info("Online mode: the local vision model is not available here, so EasyOCR is used. "
+                "Handwriting accuracy is limited - please correct the extracted text before grading.")
+    elif not ollama_status()[0] and not engines["vision_model"]:
         st.warning("Ollama is not running, so the vision model cannot be used. Start Ollama first "
                    "(see the red message in the sidebar). EasyOCR can still be used meanwhile.")
     elif engines["vision_model"]:
@@ -326,7 +341,7 @@ with right:
             except grader.GradingError as e:
                 st.warning(str(e))
             except Exception as e:
-                st.error(f"Ollama error: {e}")
+                st.error(f"Model error: {e}")
     if ss["ocr_raw"] and ss["ocr_raw"] != ss["answer_text"]:
         with st.expander("Show the original OCR text (before cleaning / editing)"):
             st.text(ss["ocr_raw"])
@@ -368,7 +383,7 @@ if st.button("Grade answer", type="primary"):
             sim_lines, sim_flag = similarity_lines(matches, compared)
 
             box = st.empty()
-            with st.spinner("Grading with DeepSeek-R1:8B... this can take 1-3 minutes"):
+            with st.spinner(f"Grading with {grader.get_model_name()}... this can take 1-3 minutes"):
                 res = grader.grade_answer(ss["question"], ss["max_marks"], ss["rubric"], ss["reference"],
                                           ss["answer_text"], progress=lambda m: box.caption(m))
             box.empty()
@@ -376,7 +391,7 @@ if st.button("Grade answer", type="primary"):
                 "student": ss["student"], "subject": subject, "question": ss["question"],
                 "max_marks": ss["max_marks"], "rubric": ss["rubric"], "reference": ss["reference"],
                 "answer": ss["answer_text"], "score": res["score"], "feedback": res["feedback"],
-                "model": grader.MODEL_NAME, "timestamp": datetime.now(),
+                "model": grader.get_model_name(), "timestamp": datetime.now(),
                 "similarity_lines": sim_lines, "similarity_flag": sim_flag,
             }
             pdf_bytes = pdf_report.build_report(data, image_bytes if include_image else None)
