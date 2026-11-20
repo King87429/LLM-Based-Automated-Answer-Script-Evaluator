@@ -63,13 +63,16 @@ def _to_jpeg_bytes(img):
 
 
 # ------------------------------------------------------------------ engine 1: vision model
-# Vision models offered by Ollama Cloud, best first ("instruct" = no long hidden thinking).
+# Vision models offered by Ollama Cloud, best first. Names change over time (qwen3-vl cloud tags were
+# retired), so if none of these exist the code asks the catalogue which models have "vision".
 # Add  OLLAMA_CLOUD_VISION_MODEL = "..."  to Streamlit Secrets to force a specific one.
 CLOUD_VISION_MODELS = [
-    "qwen3-vl:235b-instruct", "qwen3-vl:235b-instruct-cloud", "qwen3-vl:235b", "qwen3-vl:235b-cloud",
-    "gemma3:27b", "gemma3:12b", "gemma3:4b",
+    "qwen3.5:397b", "qwen3.5", "gemma4:31b", "gemma4", "qwen3.6:35b", "qwen3.6", "qwen3.8:27b", "qwen3.8",
+    "gemini-3-flash-preview", "ministral-3:14b", "gemma3:27b", "gemma3:12b",
+    "qwen3-vl:235b-instruct", "qwen3-vl:235b",
 ]
 _cloud_vision_cache = None
+VISION_PROBLEM = ""          # human-readable reason when no cloud vision model could be used
 
 
 def _online():
@@ -81,34 +84,53 @@ def _online():
         return False
 
 
+def _has_vision(client, name):
+    try:
+        info = client.show(name)
+        caps = info["capabilities"] if isinstance(info, dict) else getattr(info, "capabilities", None)
+        return bool(caps) and "vision" in [str(c).lower() for c in caps]
+    except Exception:
+        return False
+
+
 def _cloud_vision_model():
-    """Name of a vision model in the Ollama Cloud catalogue (None if no key / not found)."""
-    global _cloud_vision_cache
+    """Name of a vision-capable model in the Ollama Cloud catalogue (None if no key / none found)."""
+    global _cloud_vision_cache, VISION_PROBLEM
     if _cloud_vision_cache:
         return _cloud_vision_cache
     import grader
     if not grader.get_api_key():
+        VISION_PROBLEM = "OLLAMA_API_KEY is missing."
         return None
     forced = grader._secret("OLLAMA_CLOUD_VISION_MODEL").strip()
     try:
-        resp = grader._cloud_client(timeout=15).list()
+        client = grader._cloud_client(timeout=20)
+        resp = client.list()
         models = resp["models"] if isinstance(resp, dict) else getattr(resp, "models", [])
         names = []
         for m in models:
             n = m.get("model") if isinstance(m, dict) else getattr(m, "model", None)
             if n:
                 names.append(str(n))
-    except Exception:
+    except Exception as e:
+        VISION_PROBLEM = f"Could not read the Ollama Cloud model list ({str(e)[:80]})."
         return forced or None
+
     pick = None
     for cand in ([forced] if forced else []) + CLOUD_VISION_MODELS:
         if cand in names:
             pick = cand
             break
-    if not pick:
-        pick = next((n for n in names if "-vl" in n.lower() or n.lower().startswith("qwen3-vl")), None)
+    if not pick:                                   # ask the catalogue which models support vision
+        for n in names[:25]:
+            if _has_vision(client, n):
+                pick = n
+                break
     if pick:
         _cloud_vision_cache = pick
+        VISION_PROBLEM = ""
+    else:
+        VISION_PROBLEM = f"No vision model found among {len(names)} cloud models."
     return pick
 
 
