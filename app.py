@@ -152,7 +152,7 @@ def ollama_status():
 
 
 @st.cache_data(ttl=15, show_spinner=False)
-def engine_status():
+def engine_status(mode):          # `mode` only makes the cache separate for Local / Online
     return ocr.available_engines()
 
 
@@ -287,9 +287,9 @@ with right:
                                 key=f"uploader_{ss['uploader_n']}")
     image_bytes = uploaded.getvalue() if uploaded else None
 
-    engines = engine_status()
+    engines = engine_status(ss["mode_label"])
     if ss["mode_label"] == MODE_ONLINE and not engines["vision_model"]:
-        st.info("Online mode: the local vision model is not available here, so EasyOCR is used. "
+        st.info("Online mode: no cloud vision model could be found, so EasyOCR is used. "
                 "Handwriting accuracy is limited - please correct the extracted text before grading.")
     elif not ollama_status()[0] and not engines["vision_model"]:
         st.warning("Ollama is not running, so the vision model cannot be used. Start Ollama first "
