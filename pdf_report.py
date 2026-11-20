@@ -46,12 +46,15 @@ def _styles():
     }
 
 
+_MODEL_LABEL = ["DeepSeek-R1:8B"]      # updated by build_report() with the model actually used
+
+
 def _footer(canvas, doc):
     canvas.saveState()
     canvas.setFont("Helvetica", 8)
     canvas.setFillColor(GREY)
     canvas.drawString(2 * cm, 1.2 * cm,
-                      "AI-assisted marking (DeepSeek-R1:8B). Marks must be reviewed by the teacher.")
+                      f"AI-assisted marking ({_MODEL_LABEL[0]}). Marks must be reviewed by the teacher.")
     canvas.drawRightString(A4[0] - 2 * cm, 1.2 * cm, f"Page {doc.page}")
     canvas.restoreState()
 
@@ -75,6 +78,7 @@ def build_report(data, image_bytes=None):
     Returns the PDF as bytes.
     """
     st = _styles()
+    _MODEL_LABEL[0] = str(data.get("model") or _MODEL_LABEL[0])
     max_marks = float(data["max_marks"])
     score = float(data["score"])
     percent = (score / max_marks * 100) if max_marks else 0
