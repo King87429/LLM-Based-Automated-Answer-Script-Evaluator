@@ -1,18 +1,35 @@
 """
 grader.py - sends the question, max marks, rubric, optional reference answer and the
-(teacher-corrected) student answer to DeepSeek-R1:8B through Ollama.
+(teacher-corrected) student answer to a model through Ollama.
+
+Two modes:
+  local  -> Ollama on this computer (http://localhost:11434), model deepseek-r1:8b
+  online -> Ollama Cloud API (https://ollama.com), key from OLLAMA_API_KEY
+            (environment variable or Streamlit Secrets)
 
 Uses the SAME prompt and the SAME retry strategy as the research pipeline
 (gradeall2.py / gradeerror.py) so dashboard marks are consistent with the experiment.
 """
 import json
+import os
 import re
 import time
 
 from ollama import Client
 
-MODEL_NAME = "deepseek-r1:8b"
+LOCAL_MODEL = "deepseek-r1:8b"
+MODEL_NAME = LOCAL_MODEL     # kept for older scripts (gradeall2.py etc.) - always the local model
+
+# Preferred cloud model. Override WITHOUT editing code by adding  OLLAMA_CLOUD_MODEL = "..."
+# to Streamlit Secrets (or as an environment variable). If the name is not in the hosted
+# catalogue, _resolve_cloud_model() automatically falls back to the first available one below.
+CLOUD_MODEL = "gpt-oss:120b"
+CLOUD_FALLBACKS = ["gpt-oss:120b", "gpt-oss:20b", "deepseek-v4-flash", "kimi-k2.6", "glm-5"]
+
+LOCAL_HOST = "http://localhost:11434"
+CLOUD_HOST = "https://ollama.com"
 REQUEST_TIMEOUT = 150        # seconds to wait for ONE model reply before trying the next attempt
+ACTIVE_MODE = "local"        # "local" or "online" - set with set_mode()
 
 SCORE_SCHEMA = {
     "type": "object",
@@ -46,13 +63,77 @@ class GradingError(Exception):
 
 
 _client = None
+_cloud_model_cache = None
+
+
+def _secret(name):
+    """Read a setting from the environment, then from Streamlit Secrets ('' if not found)."""
+    val = os.getenv(name)
+    if val:
+        return val
+    try:
+        import streamlit as st
+        return str(st.secrets.get(name, "") or "")
+    except Exception:
+        return ""
+
+
+def get_api_key():
+    return _secret("OLLAMA_API_KEY").strip()
+
+
+def set_mode(mode):
+    """Switch between "local" and "online". Safe to call on every Streamlit rerun."""
+    global ACTIVE_MODE, _client
+    if mode not in ("local", "online"):
+        raise ValueError("Mode must be 'local' or 'online'")
+    if mode != ACTIVE_MODE:
+        ACTIVE_MODE = mode
+        _client = None
+
+
+def _cloud_client(timeout=REQUEST_TIMEOUT):
+    api_key = get_api_key()
+    if not api_key:
+        raise GradingError("OLLAMA_API_KEY is missing. Add it in Streamlit Secrets (or set it as an environment variable).")
+    return Client(host=CLOUD_HOST, headers={"Authorization": f"Bearer {api_key}"}, timeout=timeout)
 
 
 def _get_client():
     global _client
     if _client is None:
-        _client = Client(timeout=REQUEST_TIMEOUT)
+        if ACTIVE_MODE == "local":
+            _client = Client(host=LOCAL_HOST, timeout=REQUEST_TIMEOUT)
+        else:
+            _client = _cloud_client()
     return _client
+
+
+def _resolve_cloud_model():
+    """Use the preferred cloud model if the hosted catalogue has it, else the first fallback that exists."""
+    global _cloud_model_cache
+    if _cloud_model_cache:
+        return _cloud_model_cache
+    wanted = _secret("OLLAMA_CLOUD_MODEL").strip() or CLOUD_MODEL
+    try:
+        resp = _cloud_client(timeout=15).list()
+        names = []
+        for m in (_field(resp, "models") or []):
+            n = _field(m, "model") or _field(m, "name")
+            if n:
+                names.append(str(n))
+        for cand in [wanted] + CLOUD_FALLBACKS:
+            if cand in names:
+                wanted = cand
+                break
+        _cloud_model_cache = wanted            # cache only after a successful catalogue lookup
+    except Exception:
+        pass                                   # listing failed - just try the preferred name (not cached)
+    return wanted
+
+
+def get_model_name():
+    return LOCAL_MODEL if ACTIVE_MODE == "local" else _resolve_cloud_model()
 
 
 def _field(obj, name):
@@ -81,6 +162,13 @@ def check_ollama():
     if any(n == MODEL_NAME or n.startswith(MODEL_NAME) for n in names):
         return True, f"Ollama is running and {MODEL_NAME} is installed."
     return False, f"Ollama is running but {MODEL_NAME} is not installed. Run: ollama pull {MODEL_NAME}"
+
+
+def check_cloud():
+    """Return (ok, message) for online mode. Makes no network call - it only checks the API key exists."""
+    if get_api_key():
+        return True, "Online mode: Ollama Cloud API key found."
+    return False, "Online mode needs OLLAMA_API_KEY in Streamlit Secrets (or as an environment variable)."
 
 
 # -------------------------------------------------------------------------
@@ -172,7 +260,7 @@ Reply with ONLY this JSON and nothing else:
 # -------------------------------------------------------------------------
 def _call_model(prompt, think, fmt, temperature, num_predict, seed):
     kwargs = dict(
-        model=MODEL_NAME,
+        model=get_model_name(),
         messages=[{"role": "user", "content": prompt}],
         options={"temperature": temperature, "num_ctx": 8192, "num_predict": num_predict, "seed": seed},
     )
@@ -295,3 +383,39 @@ Respond ONLY with JSON in this form:
         except Exception as e:
             last_error = str(e)
     raise GradingError(f"Could not generate a rubric. Last problem: {last_error}")
+
+
+def clean_ocr_text(text):
+    """
+    Optional: ask the model to fix obvious OCR spelling mistakes WITHOUT changing the meaning
+    or adding anything. Returns the cleaned text. The teacher should still review it.
+    """
+    text = (text or "").strip()
+    if not text:
+        raise GradingError("There is no text to clean.")
+    prompt = f"""The text below was read from a student's handwriting by OCR and contains recognition mistakes.
+Fix ONLY obvious spelling and word-recognition errors. Do NOT add, remove or improve any content,
+do NOT correct the student's facts, and keep the original line breaks.
+
+TEXT:
+{text}
+
+Respond ONLY with JSON in this form:
+{{"cleaned": "<corrected text>"}}"""
+    last_error = "unknown error"
+    for i, (think, fmt, temp, n_predict) in enumerate(
+            [(False, {"type": "object", "properties": {"cleaned": {"type": "string"}}, "required": ["cleaned"]}, 0.0, 2048),
+             (False, "json", 0.2, 2048)], 1):
+        try:
+            raw = _clean(_call_model(prompt, think, fmt, temp, n_predict, seed=i * 13))
+            for block in reversed(re.findall(r"\{.*\}", raw, re.DOTALL)):
+                try:
+                    cleaned = str(json.loads(block).get("cleaned", "")).strip()
+                except Exception:
+                    continue
+                if cleaned:
+                    return cleaned
+            last_error = f"unusable output: {raw[:120]!r}"
+        except Exception as e:
+            last_error = str(e)
+    raise GradingError(f"Could not clean the text. Last problem: {last_error}")
