@@ -63,13 +63,67 @@ def _to_jpeg_bytes(img):
 
 
 # ------------------------------------------------------------------ engine 1: vision model
+# Vision models offered by Ollama Cloud, best first ("instruct" = no long hidden thinking).
+# Add  OLLAMA_CLOUD_VISION_MODEL = "..."  to Streamlit Secrets to force a specific one.
+CLOUD_VISION_MODELS = [
+    "qwen3-vl:235b-instruct", "qwen3-vl:235b-instruct-cloud", "qwen3-vl:235b", "qwen3-vl:235b-cloud",
+    "gemma3:27b", "gemma3:12b", "gemma3:4b",
+]
+_cloud_vision_cache = None
+
+
+def _online():
+    """True when the dashboard is in Online (Ollama Cloud) mode."""
+    try:
+        import grader
+        return grader.ACTIVE_MODE == "online"
+    except Exception:
+        return False
+
+
+def _cloud_vision_model():
+    """Name of a vision model in the Ollama Cloud catalogue (None if no key / not found)."""
+    global _cloud_vision_cache
+    if _cloud_vision_cache:
+        return _cloud_vision_cache
+    import grader
+    if not grader.get_api_key():
+        return None
+    forced = grader._secret("OLLAMA_CLOUD_VISION_MODEL").strip()
+    try:
+        resp = grader._cloud_client(timeout=15).list()
+        models = resp["models"] if isinstance(resp, dict) else getattr(resp, "models", [])
+        names = []
+        for m in models:
+            n = m.get("model") if isinstance(m, dict) else getattr(m, "model", None)
+            if n:
+                names.append(str(n))
+    except Exception:
+        return forced or None
+    pick = None
+    for cand in ([forced] if forced else []) + CLOUD_VISION_MODELS:
+        if cand in names:
+            pick = cand
+            break
+    if not pick:
+        pick = next((n for n in names if "-vl" in n.lower() or n.lower().startswith("qwen3-vl")), None)
+    if pick:
+        _cloud_vision_cache = pick
+    return pick
+
+
 def _ollama_client():
     from ollama import Client
+    if _online():
+        import grader
+        return grader._cloud_client(timeout=VISION_TIMEOUT)
     return Client(timeout=VISION_TIMEOUT)
 
 
 def installed_vision_model():
-    """Return the name of the best installed vision model, or None."""
+    """Return the name of the best available vision model (local install or Ollama Cloud), or None."""
+    if _online():
+        return _cloud_vision_model()
     try:
         from ollama import Client
         resp = Client(timeout=5).list()
@@ -100,13 +154,15 @@ def _clean_transcription(text):
 
 def _read_with_vision(image_bytes):
     model = installed_vision_model()
+    online = _online()
     if not model:
-        raise RuntimeError("No vision model is installed in Ollama. Run:  ollama pull qwen2.5vl:7b")
+        raise RuntimeError("No vision model found in Ollama Cloud (check OLLAMA_API_KEY)." if online
+                           else "No vision model is installed in Ollama. Run:  ollama pull qwen2.5vl:7b")
     img = _resize(_open_rgb(image_bytes), 1600)          # keep colour, moderate size
     response = _ollama_client().chat(
         model=model,
         messages=[{"role": "user", "content": VISION_PROMPT, "images": [_to_jpeg_bytes(img)]}],
-        options={"temperature": 0, "num_ctx": 8192, "num_predict": 2048},
+        options={"temperature": 0, "num_ctx": 8192, "num_predict": 4096 if online else 2048},
     )
     msg = response["message"] if isinstance(response, dict) else response.message
     content = msg["content"] if isinstance(msg, dict) else msg.content
