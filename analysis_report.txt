@@ -1,0 +1,26 @@
+
+LLM GRADING ANALYSIS REPORT
+
+Dataset Size: 500
+
+MAE: 1.1060
+
+RMSE: 1.4923
+
+Pearson Correlation: 0.9369
+
+Exact Match Percentage: 14.80%
+
+INTERPRETATION
+
+1. Lower MAE indicates closer agreement between
+   human and LLM grading.
+
+2. Lower RMSE indicates fewer large grading errors.
+
+3. Pearson Correlation closer to 1 indicates
+   stronger agreement between human and LLM.
+
+4. Exact Match Percentage shows how often
+   the LLM assigned exactly the same score
+   as human evaluators.

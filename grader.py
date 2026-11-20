@@ -1,0 +1,297 @@
+"""
+grader.py - sends the question, max marks, rubric, optional reference answer and the
+(teacher-corrected) student answer to DeepSeek-R1:8B through Ollama.
+
+Uses the SAME prompt and the SAME retry strategy as the research pipeline
+(gradeall2.py / gradeerror.py) so dashboard marks are consistent with the experiment.
+"""
+import json
+import re
+import time
+
+from ollama import Client
+
+MODEL_NAME = "deepseek-r1:8b"
+REQUEST_TIMEOUT = 150        # seconds to wait for ONE model reply before trying the next attempt
+
+SCORE_SCHEMA = {
+    "type": "object",
+    "properties": {"score": {"type": "number"}, "feedback": {"type": "string"}},
+    "required": ["score", "feedback"],
+}
+
+RUBRIC_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "key_points": {"type": "array", "items": {"type": "string"}},
+        "reference_answer": {"type": "string"},
+    },
+    "required": ["key_points", "reference_answer"],
+}
+
+# (think, format, temperature, num_predict, short_prompt)
+# Attempt 1 is exactly the configuration used for the research dataset grading.
+ATTEMPTS = [
+    (False, SCORE_SCHEMA, 0.0, 1024, False),
+    (True,  None,         0.0, 4096, False),
+    (False, "json",       0.3, 1024, False),
+    (True,  None,         0.5, 8192, True),
+    (False, None,         0.3, 1024, True),
+    (False, SCORE_SCHEMA, 0.7, 1024, True),
+]
+
+
+class GradingError(Exception):
+    pass
+
+
+_client = None
+
+
+def _get_client():
+    global _client
+    if _client is None:
+        _client = Client(timeout=REQUEST_TIMEOUT)
+    return _client
+
+
+def _field(obj, name):
+    """Read a field from an ollama response object or a plain dict."""
+    if isinstance(obj, dict):
+        return obj.get(name)
+    return getattr(obj, name, None)
+
+
+# -------------------------------------------------------------------------
+# Ollama status
+# -------------------------------------------------------------------------
+def check_ollama():
+    """Return (ok, message). ok is True only if Ollama runs AND the model is installed."""
+    try:
+        resp = Client(timeout=5).list()
+        models = _field(resp, "models") or []
+        names = []
+        for m in models:
+            n = _field(m, "model") or _field(m, "name")
+            if n:
+                names.append(str(n))
+    except Exception:
+        return False, "Ollama is not running. Start the Ollama app, then refresh this page."
+
+    if any(n == MODEL_NAME or n.startswith(MODEL_NAME) for n in names):
+        return True, f"Ollama is running and {MODEL_NAME} is installed."
+    return False, f"Ollama is running but {MODEL_NAME} is not installed. Run: ollama pull {MODEL_NAME}"
+
+
+# -------------------------------------------------------------------------
+# Rubric helpers
+# -------------------------------------------------------------------------
+def _num(x):
+    return f"{round(float(x), 2):g}"
+
+
+def default_rubric(max_marks):
+    """General rubric template. The teacher should edit it to match the question."""
+    each = _num(float(max_marks) / 5)
+    return (
+        f"Score out of {_num(max_marks)}. Award ~{each} points for each of the following criteria: "
+        "1) Relevance - the answer addresses the question that was asked. "
+        "2) Conceptual accuracy - the statements made are factually correct. "
+        "3) Coverage - the key points expected for this question are covered. "
+        "4) Explanation - concepts are explained with reasons, examples or applications. "
+        "5) Clarity and organisation - the answer is well structured and easy to follow. "
+        "Deduct for incorrect statements."
+    )
+
+
+def _rubric_from_points(points, max_marks):
+    each = _num(float(max_marks) / len(points))
+    numbered = " ".join(f"{i}) {p.strip().rstrip('.')}." for i, p in enumerate(points, 1))
+    return (
+        f"Score out of {_num(max_marks)}. Award ~{each} points for each of the following points "
+        f"the answer correctly covers: {numbered} "
+        "Deduct for incorrect statements; consider overall clarity and completeness."
+    )
+
+
+# -------------------------------------------------------------------------
+# Prompts
+# -------------------------------------------------------------------------
+def _reference_text(reference):
+    ref = (reference or "").strip()
+    return ref if ref else "Not provided. Judge correctness using the rubric and your subject knowledge."
+
+
+def build_prompt(question, max_marks, rubric, reference, answer):
+    return f"""You are an experienced and strict university examiner.
+
+Evaluate the student's answer ONLY according to the question, rubric and reference answer.
+
+QUESTION:
+{question}
+
+MAXIMUM MARKS: {_num(max_marks)}
+
+RUBRIC:
+{rubric}
+
+REFERENCE ANSWER:
+{_reference_text(reference)}
+
+STUDENT ANSWER:
+{answer}
+
+GRADING RULES:
+1. Follow the rubric strictly and add up the marks for each point covered.
+2. Do not award marks for incorrect information.
+3. Give partial marks when only some required concepts are covered.
+4. Do not require the student's wording to match the reference answer exactly.
+5. The score must be a number between 0 and {_num(max_marks)}.
+6. The feedback must be 1-2 sentences explaining why marks were awarded or deducted.
+7. The answer was read from handwriting by OCR, so ignore small spelling or OCR mistakes.
+
+Respond ONLY with JSON in this form:
+{{"score": <number>, "feedback": "<short explanation>"}}
+"""
+
+
+def build_short_prompt(question, max_marks, rubric, reference, answer):
+    return f"""Grade this student answer out of {_num(max_marks)}.
+
+Question: {question}
+Rubric: {rubric}
+Reference answer: {_reference_text(reference)}
+Student answer: {answer}
+
+Reply with ONLY this JSON and nothing else:
+{{"score": <number from 0 to {_num(max_marks)}>, "feedback": "<one or two sentences>"}}"""
+
+
+# -------------------------------------------------------------------------
+# Model call + parsing
+# -------------------------------------------------------------------------
+def _call_model(prompt, think, fmt, temperature, num_predict, seed):
+    kwargs = dict(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": prompt}],
+        options={"temperature": temperature, "num_ctx": 8192, "num_predict": num_predict, "seed": seed},
+    )
+    if fmt is not None:
+        kwargs["format"] = fmt
+    client = _get_client()
+    try:
+        response = client.chat(think=think, **kwargs)
+    except TypeError:                      # older ollama library without `think`
+        response = client.chat(**kwargs)
+
+    msg = _field(response, "message")
+    content = _field(msg, "content") or ""
+    thinking = _field(msg, "thinking") or ""
+    if not content.strip() and thinking.strip():
+        content = thinking                 # answer is sometimes only inside the thinking text
+    return content
+
+
+def _clean(text):
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    return re.sub(r"```(?:json)?", "", text).strip()
+
+
+def parse_score(text):
+    """Return (score, feedback); either can be None if not found."""
+    text = _clean(text)
+    for block in reversed(re.findall(r"\{[^{}]*\}", text, re.DOTALL)):
+        try:
+            data = json.loads(block)
+            return float(data["score"]), str(data.get("feedback", "")).strip()
+        except Exception:
+            continue
+
+    score_m = re.search(r'"?score"?\s*[:=]\s*"?(\d+(?:\.\d+)?)', text, re.IGNORECASE)
+    fb_m = re.search(r'"?feedback"?\s*[:=]\s*"(.*?)"\s*[,}]', text, re.IGNORECASE | re.DOTALL)
+    if not fb_m:
+        fb_m = re.search(r'"?feedback"?\s*[:=]\s*"?(.*?)"?\s*}?\s*$', text, re.IGNORECASE | re.DOTALL)
+    score = float(score_m.group(1)) if score_m else None
+    feedback = fb_m.group(1).strip(' "\n') if fb_m else None
+    return score, feedback
+
+
+# -------------------------------------------------------------------------
+# Public functions
+# -------------------------------------------------------------------------
+def grade_answer(question, max_marks, rubric, reference, answer, max_attempts=6, progress=None):
+    """
+    Grade one answer. Returns {"score", "feedback", "attempt", "seconds"}.
+    Raises GradingError if no valid score + feedback could be obtained.
+    `progress` is an optional function called with a status string.
+    """
+    max_marks = float(max_marks)
+    answer = " ".join(str(answer).split())          # collapse line breaks / extra spaces from OCR
+    if not answer:
+        raise GradingError("The student answer is empty.")
+
+    started = time.time()
+    last_error = "unknown error"
+    for attempt in range(1, max_attempts + 1):
+        think, fmt, temp, n_predict, short = ATTEMPTS[(attempt - 1) % len(ATTEMPTS)]
+        builder = build_short_prompt if short else build_prompt
+        prompt = builder(question, max_marks, rubric, reference, answer)
+        if progress:
+            progress(f"Grading... attempt {attempt}/{max_attempts}")
+        try:
+            raw = _call_model(prompt, think, fmt, temp, n_predict, seed=attempt * 7 + 1)
+            score, feedback = parse_score(raw)
+            if score is None:
+                last_error = f"no score in model output: {raw[:120]!r}"
+            elif not feedback:
+                last_error = f"no feedback in model output: {raw[:120]!r}"
+            else:
+                return {
+                    "score": round(max(0.0, min(score, max_marks)), 2),
+                    "feedback": feedback,
+                    "attempt": attempt,
+                    "seconds": round(time.time() - started, 1),
+                }
+        except Exception as e:
+            last_error = str(e)
+        time.sleep(1)
+
+    raise GradingError(f"Could not get a valid grade after {max_attempts} attempts. Last problem: {last_error}")
+
+
+def suggest_rubric(question, max_marks, subject=""):
+    """
+    Ask the model for key points + a short reference answer for a NEW question.
+    Returns {"rubric": str, "reference_answer": str}. The teacher must review both.
+    """
+    topic = f" in {subject}" if subject else ""
+    prompt = f"""You are an experienced university examiner{topic}.
+
+For the exam question below, write the 4 most important key points a correct answer must cover,
+and a concise model reference answer (3-5 sentences) that contains those points.
+Be factually correct. Each key point must be one short sentence.
+
+QUESTION:
+{question}
+
+Respond ONLY with JSON in this form:
+{{"key_points": ["point 1", "point 2", "point 3", "point 4"], "reference_answer": "model answer"}}"""
+
+    configs = [(False, RUBRIC_SCHEMA, 0.0, 1500), (False, "json", 0.3, 1500), (True, None, 0.3, 6000)]
+    last_error = "unknown error"
+    for i, (think, fmt, temp, n_predict) in enumerate(configs, 1):
+        try:
+            raw = _clean(_call_model(prompt, think, fmt, temp, n_predict, seed=i * 11))
+            for block in reversed(re.findall(r"\{[^{}]*\}", raw, re.DOTALL)):
+                try:
+                    data = json.loads(block)
+                except Exception:
+                    continue
+                points = [str(p).strip() for p in data.get("key_points", []) if str(p).strip()]
+                reference = str(data.get("reference_answer", "")).strip()
+                if 2 <= len(points) <= 6 and reference:
+                    return {"rubric": _rubric_from_points(points, max_marks), "reference_answer": reference}
+            last_error = f"unusable output: {raw[:120]!r}"
+        except Exception as e:
+            last_error = str(e)
+    raise GradingError(f"Could not generate a rubric. Last problem: {last_error}")

@@ -1,0 +1,16 @@
+
+========================================
+LLM GRADING EVALUATION RESULTS
+========================================
+
+Total Records: 500
+
+Mean Absolute Error (MAE): 1.1060
+
+Root Mean Square Error (RMSE): 1.4923
+
+Pearson Correlation: 0.9369
+
+Exact Match Percentage: 14.80%
+
+========================================
