@@ -178,6 +178,7 @@ def reset_all():
     ss["ocr_conf"] = None
     ss["ocr_engine"] = ""
     ss["ocr_raw"] = ""
+    ss["ocr_note"] = ""
     ss["result"] = None
     ss["uploader_n"] += 1
 
@@ -191,6 +192,7 @@ ss.setdefault("rubric_auto", None)
 ss.setdefault("ocr_conf", None)
 ss.setdefault("ocr_engine", "")
 ss.setdefault("ocr_raw", "")
+ss.setdefault("ocr_note", "")
 ss.setdefault("result", None)
 ss.setdefault("uploader_n", 0)
 
@@ -311,7 +313,8 @@ with right:
                 with st.spinner("Reading handwriting... (a vision model can take 1-2 minutes)"):
                     out = ocr.read_image(image_bytes, engine)
                 ss["_pending"] = {"answer_text": out["text"], "ocr_conf": out["confidence"],
-                                  "ocr_engine": out["engine"], "ocr_raw": out["text"]}
+                                  "ocr_engine": out["engine"], "ocr_raw": out["text"],
+                                  "ocr_note": out.get("note", "")}
                 st.rerun()
             except Exception as e:
                 st.error(f"Could not read the image. {e}")
@@ -321,6 +324,9 @@ with right:
                  placeholder="The text read from the image appears here. Fix any OCR mistakes.")
     st.caption("If the photo also contains the question or marks, delete those lines from the box above - "
                "only the student's answer should be graded.")
+    if ss.get("ocr_note"):
+        st.warning("The vision model could not be used, so EasyOCR was used instead (much weaker on "
+                   f"handwriting). Reason: {ss['ocr_note']}")
     if ss.get("ocr_engine"):
         msg = f"Text read using: {ss['ocr_engine']}."
         if ss["ocr_conf"] is None:
