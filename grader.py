@@ -64,6 +64,8 @@ class GradingError(Exception):
 
 _client = None
 _cloud_model_cache = None
+_ollama_blocked_until = 0.0      # when Ollama Cloud refuses (no credits), use Gemini until this time
+_gemini_used = ""                # name of the Gemini model that last answered
 
 
 def _secret(name):
@@ -132,8 +134,16 @@ def _resolve_cloud_model():
     return wanted
 
 
+def _gemini_key():
+    return _secret("GEMINI_API_KEY").strip()
+
+
 def get_model_name():
-    return LOCAL_MODEL if ACTIVE_MODE == "local" else _resolve_cloud_model()
+    if ACTIVE_MODE == "local":
+        return LOCAL_MODEL
+    if _gemini_key() and (not get_api_key() or time.time() < _ollama_blocked_until):
+        return _gemini_used or "Google Gemini"
+    return _resolve_cloud_model()
 
 
 def _field(obj, name):
@@ -165,10 +175,14 @@ def check_ollama():
 
 
 def check_cloud():
-    """Return (ok, message) for online mode. Makes no network call - it only checks the API key exists."""
+    """Return (ok, message) for online mode. Makes no network call - it only checks that a key exists."""
+    if get_api_key() and _gemini_key():
+        return True, "Online mode: Ollama Cloud key found (Gemini key found as backup)."
     if get_api_key():
         return True, "Online mode: Ollama Cloud API key found."
-    return False, "Online mode needs OLLAMA_API_KEY in Streamlit Secrets (or as an environment variable)."
+    if _gemini_key():
+        return True, "Online mode: Google Gemini key found."
+    return False, "Online mode needs OLLAMA_API_KEY (or GEMINI_API_KEY) in Streamlit Secrets."
 
 
 # -------------------------------------------------------------------------
@@ -258,7 +272,44 @@ Reply with ONLY this JSON and nothing else:
 # -------------------------------------------------------------------------
 # Model call + parsing
 # -------------------------------------------------------------------------
+def _is_payment_error(e):
+    t = str(e).lower()
+    return "402" in t or "usage credits" in t or "subscribe" in t or "usage limit" in t or "429" in t
+
+
+def _gemini_generate(prompt, fmt, temperature, num_predict, seed):
+    """Text generation with Google Gemini (free key) - used when Ollama Cloud needs credits."""
+    global _gemini_used
+    import requests
+    import ocr                                    # reuses the live list of current Gemini models
+    cfg = {"temperature": temperature, "maxOutputTokens": max(num_predict, 4096), "seed": int(seed)}
+    if fmt is not None:
+        cfg["responseMimeType"] = "application/json"
+    payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": cfg}
+    errors = []
+    for model in ocr._gemini_models():
+        try:
+            r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                              headers={"x-goog-api-key": _gemini_key()}, json=payload, timeout=REQUEST_TIMEOUT)
+            if r.status_code != 200:
+                errors.append(f"{model}: HTTP {r.status_code} {r.text[:80]}")
+                continue
+            parts = r.json()["candidates"][0]["content"]["parts"]
+            text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
+            if text.strip():
+                _gemini_used = model
+                return text
+            errors.append(f"{model}: empty reply")
+        except Exception as e:
+            errors.append(f"{model}: {str(e)[:80]}")
+    raise GradingError("Gemini could not answer. " + "; ".join(errors))
+
+
 def _call_model(prompt, think, fmt, temperature, num_predict, seed):
+    global _ollama_blocked_until
+    if ACTIVE_MODE == "online" and _gemini_key():
+        if not get_api_key() or time.time() < _ollama_blocked_until:
+            return _gemini_generate(prompt, fmt, temperature, num_predict, seed)
     kwargs = dict(
         model=get_model_name(),
         messages=[{"role": "user", "content": prompt}],
@@ -268,9 +319,15 @@ def _call_model(prompt, think, fmt, temperature, num_predict, seed):
         kwargs["format"] = fmt
     client = _get_client()
     try:
-        response = client.chat(think=think, **kwargs)
-    except TypeError:                      # older ollama library without `think`
-        response = client.chat(**kwargs)
+        try:
+            response = client.chat(think=think, **kwargs)
+        except TypeError:                      # older ollama library without `think`
+            response = client.chat(**kwargs)
+    except Exception as e:
+        if ACTIVE_MODE == "online" and _gemini_key() and _is_payment_error(e):
+            _ollama_blocked_until = time.time() + 600      # Ollama Cloud needs credits: use Gemini for 10 min
+            return _gemini_generate(prompt, fmt, temperature, num_predict, seed)
+        raise
 
     msg = _field(response, "message")
     content = _field(msg, "content") or ""
