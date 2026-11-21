@@ -68,7 +68,7 @@ def _to_jpeg_bytes(img):
 # Add  OLLAMA_CLOUD_VISION_MODEL = "..."  to Streamlit Secrets to force a specific one.
 CLOUD_VISION_MODELS = [
     "qwen3.5:397b", "qwen3.5", "gemma4:31b", "gemma4", "qwen3.6:35b", "qwen3.6", "qwen3.8:27b", "qwen3.8",
-    "gemini-3-flash-preview", "ministral-3:14b", "gemma3:27b", "gemma3:12b",
+    "ministral-3:14b", "ministral-3:8b", "ministral-3:3b", "gemma3:27b", "gemma3:12b", "gemma3:4b", "gemini-3-flash-preview",
     "qwen3-vl:235b-instruct", "qwen3-vl:235b",
 ]
 _cloud_vision_cache = None          # ordered list of usable cloud vision models
@@ -117,11 +117,11 @@ def _cloud_vision_models():
         return [forced] if forced else []
 
     picks = [c for c in ([forced] if forced else []) + CLOUD_VISION_MODELS if c in names]
-    if len(picks) < 3:                             # also ask the catalogue which models support vision
-        for n in names[:30]:
+    if len(picks) < 6:                             # also ask the catalogue which models support vision
+        for n in names[:40]:
             if n not in picks and _has_vision(client, n):
                 picks.append(n)
-            if len(picks) >= 4:
+            if len(picks) >= 7:
                 break
     if picks:
         _cloud_vision_cache = picks
@@ -145,8 +145,10 @@ def _ollama_client():
 
 
 def installed_vision_model():
-    """Return the name of the best available vision model (local install or Ollama Cloud), or None."""
+    """Return the name of the best available vision model (local install, Gemini or Ollama Cloud), or None."""
     if _online():
+        if _gemini_key():
+            return f"{_gemini_models()[0]} (Google Gemini)"
         return _cloud_vision_model()
     try:
         from ollama import Client
@@ -191,7 +193,7 @@ def _chat_vision(client, model, jpeg, num_predict):
 
 def _read_with_vision(image_bytes):
     online = _online()
-    models = _cloud_vision_models()[:3] if online else [installed_vision_model()]
+    models = _cloud_vision_models()[:7] if online else [installed_vision_model()]
     models = [m for m in models if m]
     if not models:
         raise RuntimeError("No vision model found in Ollama Cloud. " + (VISION_PROBLEM or "Check OLLAMA_API_KEY.")
@@ -208,6 +210,54 @@ def _read_with_vision(image_bytes):
             errors.append(f"{model}: empty reply")
         except Exception as e:
             errors.append(f"{model}: {str(e)[:120]}")
+    raise RuntimeError("; ".join(errors))
+
+
+# ------------------------------------------------------------------ engine 1b: Google Gemini (optional, online)
+# Free API key from https://aistudio.google.com/apikey -> add to Streamlit Secrets:  GEMINI_API_KEY = "..."
+# Optional:  GEMINI_MODEL = "gemini-2.5-flash"  to force a model.
+GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-flash-lite"]
+
+
+def _gemini_key():
+    try:
+        import grader
+        return grader._secret("GEMINI_API_KEY").strip()
+    except Exception:
+        return ""
+
+
+def _gemini_models():
+    import grader
+    forced = grader._secret("GEMINI_MODEL").strip()
+    return [forced] + [m for m in GEMINI_MODELS if m != forced] if forced else list(GEMINI_MODELS)
+
+
+def _read_with_gemini(image_bytes):
+    import requests
+    key = _gemini_key()
+    if not key:
+        raise RuntimeError("GEMINI_API_KEY is not set")
+    jpeg = _to_jpeg_bytes(_resize(_open_rgb(image_bytes), 1600))
+    payload = {"contents": [{"parts": [{"text": VISION_PROMPT},
+                                       {"inline_data": {"mime_type": "image/jpeg",
+                                                        "data": base64.b64encode(jpeg).decode()}}]}],
+               "generationConfig": {"temperature": 0}}
+    errors = []
+    for model in _gemini_models():
+        try:
+            r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                              headers={"x-goog-api-key": key}, json=payload, timeout=120)
+            if r.status_code != 200:
+                errors.append(f"{model}: HTTP {r.status_code} {r.text[:100]}")
+                continue
+            parts = r.json()["candidates"][0]["content"]["parts"]
+            text = _clean_transcription("".join(p.get("text", "") for p in parts))
+            if text.strip():
+                return text, None, f"Gemini ({model})"
+            errors.append(f"{model}: empty reply")
+        except Exception as e:
+            errors.append(f"{model}: {str(e)[:100]}")
     raise RuntimeError("; ".join(errors))
 
 
@@ -330,13 +380,17 @@ def read_image(image_bytes, engine="auto"):
     Returns {"text": str, "confidence": float | None, "engine": str}.
     Raises RuntimeError listing every reason if nothing could read the image.
     """
-    order = {"auto": [_read_with_vision, _read_with_easyocr],
-             "vision": [_read_with_vision],
+    vision_fns = [_read_with_vision]
+    if _online() and _gemini_key():
+        vision_fns = [_read_with_gemini, _read_with_vision]       # Gemini first, Ollama Cloud as backup
+    order = {"auto": vision_fns + [_read_with_easyocr],
+             "vision": vision_fns,
              "easyocr": [_read_with_easyocr]}[engine]
+    names = {_read_with_gemini: "Gemini", _read_with_vision: "Vision model", _read_with_easyocr: "EasyOCR"}
 
     problems = []
     for fn in order:
-        name = "Vision model" if fn is _read_with_vision else "EasyOCR"
+        name = names[fn]
         try:
             text, conf, used = fn(image_bytes)
             if text.strip():
