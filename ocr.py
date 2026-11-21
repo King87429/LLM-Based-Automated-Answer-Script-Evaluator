@@ -227,10 +227,40 @@ def _gemini_key():
         return ""
 
 
+_gemini_cache = None
+
+
 def _gemini_models():
+    """Newest available Gemini Flash models, taken from Google's live model list (names change often)."""
+    global _gemini_cache
     import grader
     forced = grader._secret("GEMINI_MODEL").strip()
-    return [forced] + [m for m in GEMINI_MODELS if m != forced] if forced else list(GEMINI_MODELS)
+    if _gemini_cache is None:
+        found = []
+        try:
+            import requests
+            r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
+                             headers={"x-goog-api-key": _gemini_key()}, params={"pageSize": 200}, timeout=20)
+            if r.status_code == 200:
+                skip = ("image", "tts", "audio", "live", "embedding", "robotics", "computer", "gemma",
+                        "learnlm", "aqa", "imagen", "veo", "native", "exp", "thinking", "customtools")
+                rows = []
+                for m in r.json().get("models", []):
+                    name = str(m.get("name", "")).replace("models/", "")
+                    if ("generateContent" not in m.get("supportedGenerationMethods", [])
+                            or "flash" not in name or any(s in name for s in skip)):
+                        continue
+                    ver = re.search(r"gemini-(\d+(?:\.\d+)?)", name)
+                    rows.append((0 if "lite" in name else 1,          # full Flash before Flash-Lite (better at handwriting)
+                                 float(ver.group(1)) if ver else 0.0,   # then newest version
+                                 0 if "preview" in name else 1,       # then stable before preview
+                                 name))
+                rows.sort(reverse=True)
+                found = [r_[3] for r_ in rows][:5]
+        except Exception:
+            found = []
+        _gemini_cache = found or list(GEMINI_MODELS)
+    return ([forced] + [m for m in _gemini_cache if m != forced]) if forced else list(_gemini_cache)
 
 
 def _read_with_gemini(image_bytes):
