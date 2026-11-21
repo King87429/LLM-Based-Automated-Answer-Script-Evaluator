@@ -71,8 +71,8 @@ CLOUD_VISION_MODELS = [
     "gemini-3-flash-preview", "ministral-3:14b", "gemma3:27b", "gemma3:12b",
     "qwen3-vl:235b-instruct", "qwen3-vl:235b",
 ]
-_cloud_vision_cache = None
-VISION_PROBLEM = ""          # human-readable reason when no cloud vision model could be used
+_cloud_vision_cache = None          # ordered list of usable cloud vision models
+VISION_PROBLEM = ""                 # human-readable reason when no cloud vision model could be used
 
 
 def _online():
@@ -93,15 +93,15 @@ def _has_vision(client, name):
         return False
 
 
-def _cloud_vision_model():
-    """Name of a vision-capable model in the Ollama Cloud catalogue (None if no key / none found)."""
+def _cloud_vision_models():
+    """Ordered list of vision-capable models in the Ollama Cloud catalogue (empty if none / no key)."""
     global _cloud_vision_cache, VISION_PROBLEM
     if _cloud_vision_cache:
         return _cloud_vision_cache
     import grader
     if not grader.get_api_key():
         VISION_PROBLEM = "OLLAMA_API_KEY is missing."
-        return None
+        return []
     forced = grader._secret("OLLAMA_CLOUD_VISION_MODEL").strip()
     try:
         client = grader._cloud_client(timeout=20)
@@ -114,24 +114,26 @@ def _cloud_vision_model():
                 names.append(str(n))
     except Exception as e:
         VISION_PROBLEM = f"Could not read the Ollama Cloud model list ({str(e)[:80]})."
-        return forced or None
+        return [forced] if forced else []
 
-    pick = None
-    for cand in ([forced] if forced else []) + CLOUD_VISION_MODELS:
-        if cand in names:
-            pick = cand
-            break
-    if not pick:                                   # ask the catalogue which models support vision
-        for n in names[:25]:
-            if _has_vision(client, n):
-                pick = n
+    picks = [c for c in ([forced] if forced else []) + CLOUD_VISION_MODELS if c in names]
+    if len(picks) < 3:                             # also ask the catalogue which models support vision
+        for n in names[:30]:
+            if n not in picks and _has_vision(client, n):
+                picks.append(n)
+            if len(picks) >= 4:
                 break
-    if pick:
-        _cloud_vision_cache = pick
+    if picks:
+        _cloud_vision_cache = picks
         VISION_PROBLEM = ""
     else:
         VISION_PROBLEM = f"No vision model found among {len(names)} cloud models."
-    return pick
+    return picks
+
+
+def _cloud_vision_model():
+    picks = _cloud_vision_models()
+    return picks[0] if picks else None
 
 
 def _ollama_client():
@@ -174,21 +176,39 @@ def _clean_transcription(text):
     return "\n".join(l.rstrip() for l in lines).strip()
 
 
-def _read_with_vision(image_bytes):
-    model = installed_vision_model()
-    online = _online()
-    if not model:
-        raise RuntimeError("No vision model found in Ollama Cloud (check OLLAMA_API_KEY)." if online
-                           else "No vision model is installed in Ollama. Run:  ollama pull qwen2.5vl:7b")
-    img = _resize(_open_rgb(image_bytes), 1600)          # keep colour, moderate size
-    response = _ollama_client().chat(
-        model=model,
-        messages=[{"role": "user", "content": VISION_PROMPT, "images": [_to_jpeg_bytes(img)]}],
-        options={"temperature": 0, "num_ctx": 8192, "num_predict": 4096 if online else 2048},
-    )
+def _chat_vision(client, model, jpeg, num_predict):
+    kwargs = dict(model=model,
+                  messages=[{"role": "user", "content": VISION_PROMPT, "images": [jpeg]}],
+                  options={"temperature": 0, "num_ctx": 8192, "num_predict": num_predict})
+    try:
+        response = client.chat(think=False, **kwargs)     # thinking models would waste the token budget
+    except Exception:
+        response = client.chat(**kwargs)                  # old client / model without a thinking switch
     msg = response["message"] if isinstance(response, dict) else response.message
     content = msg["content"] if isinstance(msg, dict) else msg.content
-    return _clean_transcription(content), None, f"Vision model ({model})"
+    return _clean_transcription(content)
+
+
+def _read_with_vision(image_bytes):
+    online = _online()
+    models = _cloud_vision_models()[:3] if online else [installed_vision_model()]
+    models = [m for m in models if m]
+    if not models:
+        raise RuntimeError("No vision model found in Ollama Cloud. " + (VISION_PROBLEM or "Check OLLAMA_API_KEY.")
+                           if online else "No vision model is installed in Ollama. Run:  ollama pull qwen2.5vl:7b")
+    img = _resize(_open_rgb(image_bytes), 1600)          # keep colour, moderate size
+    jpeg = _to_jpeg_bytes(img)
+    client = _ollama_client()
+    errors = []
+    for model in models:                                 # cloud: try the next model if one fails
+        try:
+            text = _chat_vision(client, model, jpeg, 4096 if online else 2048)
+            if text.strip():
+                return text, None, f"Vision model ({model})"
+            errors.append(f"{model}: empty reply")
+        except Exception as e:
+            errors.append(f"{model}: {str(e)[:120]}")
+    raise RuntimeError("; ".join(errors))
 
 
 # ------------------------------------------------------------------ engine 2: EasyOCR
@@ -320,7 +340,10 @@ def read_image(image_bytes, engine="auto"):
         try:
             text, conf, used = fn(image_bytes)
             if text.strip():
-                return {"text": text, "confidence": conf, "engine": used}
+                result = {"text": text, "confidence": conf, "engine": used}
+                if problems:                       # an earlier engine failed - tell the teacher why
+                    result["note"] = " | ".join(problems)
+                return result
             problems.append(f"{name}: no text was found in the image")
         except Exception as e:
             problems.append(f"{name}: {e}")
